@@ -55,7 +55,24 @@
     var lead = m[1], core = m[2], tail = m[3];
     if (!core) return raw;
     var hit = DICT[core];
+    if (hit == null && /\s{2,}|\n/.test(core)) hit = DICT[core.replace(/\s+/g, ' ').trim()];
     if (hit != null) return lead + hit + tail;
+
+    /* money in Korean format: 81만 원 / 2,980,750원  ->  {0} template */
+    var money = takeMoney(core);
+    if (money.map.length) {
+      var tpl = money.text;
+      var th = DICT[tpl];
+      if (th == null && /\s{2,}|\n/.test(tpl)) th = DICT[tpl.replace(/\s+/g, ' ').trim()];
+      if (th == null && /^\{0\}$/.test(tpl.trim())) th = '{0}';
+      if (th != null) return lead + putMoney(th, money.map) + tail;
+      for (var mi = 0; mi < PATTERNS.length; mi++) {
+        if (PATTERNS[mi][0].test(tpl)) {
+          var mo = tpl.replace(PATTERNS[mi][0], PATTERNS[mi][1]);
+          if (!HANGUL.test(mo)) return lead + putMoney(mo, money.map) + tail;
+        }
+      }
+    }
     for (var i = 0; i < PATTERNS.length; i++) {
       var p = PATTERNS[i];
       if (p[0].test(core)) {
@@ -67,6 +84,26 @@
     if (seg != null) return lead + seg + tail;
     report(core);
     return raw;
+  }
+
+
+  /* Korean money -> token template; values are formatted as ₩1,234,567 */
+  function won(n) { return '₩' + n.toLocaleString('en-US'); }
+  function takeMoney(core) {
+    var map = [];
+    var out = core.replace(/([\d,]+)\s*만(?:\s*([\d,]+))?\s*원/g, function (all, a, b) {
+      var n = parseInt(a.replace(/,/g, ''), 10) * 10000 + (b ? parseInt(b.replace(/,/g, ''), 10) : 0);
+      map.push(won(n));
+      return '{' + (map.length - 1) + '}';
+    });
+    out = out.replace(/([+\-]?[\d,]+)\s*원/g, function (all, a) {
+      map.push('₩' + a);
+      return '{' + (map.length - 1) + '}';
+    });
+    return { text: out, map: map };
+  }
+  function putMoney(s, map) {
+    return s.replace(/\{(\d+)\}/g, function (all, i) { return map[+i] != null ? map[+i] : all; });
   }
 
   /* A small unit: dictionary hit or pattern hit, no whitespace trimming. */
@@ -161,8 +198,9 @@
   function walk(node) {
     if (node.nodeType === 3) { trText(node); return; }
     if (node.nodeType !== 1) return;
+    if (node.tagName !== 'SCRIPT' && node.tagName !== 'STYLE' && node.tagName !== 'SVG' &&
+        !(node.classList && node.classList.contains('onetap-lang'))) trAttrs(node);
     if (skipped(node)) return;
-    trAttrs(node);
     if (node.tagName === 'META') return;
     for (var c = node.firstChild; c; c = c.nextSibling) walk(c);
   }
@@ -293,10 +331,11 @@
       for (var i = 0; i < muts.length; i++) {
         var m = muts[i];
         if (m.type === 'characterData') { trText(m.target); continue; }
+        if (m.type === 'attributes') { if (m.target.nodeType === 1 && !skipped(m.target)) trAttrs(m.target); continue; }
         for (var j = 0; j < m.addedNodes.length; j++) walk(m.addedNodes[j]);
       }
     });
-    observer.observe(doc.body, { childList: true, subtree: true, characterData: true });
+    observer.observe(doc.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['placeholder', 'aria-label', 'title', 'alt'] });
   }
 
   function setLang(lang) {
