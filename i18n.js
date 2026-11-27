@@ -49,6 +49,24 @@
     if (root.console && console.warn) console.warn('I18N_MISS: ' + text);
   }
 
+  /* Pattern with capture translation: captures that still hold Korean are looked up too. */
+  function applyPattern(core, p) {
+    if (!p[0].test(core)) return null;
+    var m = p[0].exec(core);
+    var caps = [], i, ok = true;
+    for (i = 1; i < m.length; i++) {
+      var c = m[i];
+      if (c == null) { caps[i] = ''; continue; }
+      if (HANGUL.test(c)) {
+        var t = lookupSmall(c.trim());
+        if (t == null) { ok = false; caps[i] = c; } else { caps[i] = t; }
+      } else { caps[i] = c; }
+    }
+    var out = p[1].replace(/\$(\d+)/g, function (all, n) { return caps[+n] != null ? caps[+n] : all; });
+    if (!ok || HANGUL.test(out)) return null;
+    return out;
+  }
+
   function tr(raw) {
     if (typeof raw !== 'string' || !HANGUL.test(raw)) return raw;
     var m = /^(\s*)([\s\S]*?)(\s*)$/.exec(raw);
@@ -57,6 +75,14 @@
     var hit = DICT[core];
     if (hit == null && /\s{2,}|\n/.test(core)) hit = DICT[core.replace(/\s+/g, ' ').trim()];
     if (hit != null) return lead + hit + tail;
+
+    /* Korean date: 2026년 11월 27일 -> November 27, 2026 */
+    var dt = /^(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일$/.exec(core);
+    if (dt) {
+      var MO = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+      var mm = parseInt(dt[2], 10);
+      if (mm >= 1 && mm <= 12) return lead + MO[mm - 1] + ' ' + parseInt(dt[3], 10) + ', ' + dt[1] + tail;
+    }
 
     /* money in Korean format: 81만 원 / 2,980,750원  ->  {0} template */
     var money = takeMoney(core);
@@ -67,18 +93,13 @@
       if (th == null && /^\{0\}$/.test(tpl.trim())) th = '{0}';
       if (th != null) return lead + putMoney(th, money.map) + tail;
       for (var mi = 0; mi < PATTERNS.length; mi++) {
-        if (PATTERNS[mi][0].test(tpl)) {
-          var mo = tpl.replace(PATTERNS[mi][0], PATTERNS[mi][1]);
-          if (!HANGUL.test(mo)) return lead + putMoney(mo, money.map) + tail;
-        }
+        var mo = applyPattern(tpl, PATTERNS[mi]);
+        if (mo != null) return lead + putMoney(mo, money.map) + tail;
       }
     }
     for (var i = 0; i < PATTERNS.length; i++) {
-      var p = PATTERNS[i];
-      if (p[0].test(core)) {
-        var out = core.replace(p[0], p[1]);
-        if (!HANGUL.test(out)) return lead + out + tail;
-      }
+      var pout = applyPattern(core, PATTERNS[i]);
+      if (pout != null) return lead + pout + tail;
     }
     var seg = trSegments(core);
     if (seg != null) return lead + seg + tail;
@@ -111,11 +132,8 @@
     var hit = DICT[unit];
     if (hit != null) return hit;
     for (var i = 0; i < PATTERNS.length; i++) {
-      var p = PATTERNS[i];
-      if (p[0].test(unit)) {
-        var out = unit.replace(p[0], p[1]);
-        if (!HANGUL.test(out)) return out;
-      }
+      var pout = applyPattern(unit, PATTERNS[i]);
+      if (pout != null) return pout;
     }
     return null;
   }
@@ -137,8 +155,9 @@
       var out = [];
       for (var i = 0; i < lines.length; i++) {
         var line = lines[i];
+        if (!line.trim()) { out.push(line); continue; }
         var t = line.indexOf('|') > -1 ? trPipe(line) : lookupSmall(line.trim());
-        if (t == null) return null;
+        if (t == null) { if (root.__I18N_DEBUG) (root.__I18N_SEGFAIL = root.__I18N_SEGFAIL || []).push(line); return null; }
         out.push(t);
       }
       return out.join('\n');
@@ -181,6 +200,17 @@
       if (out !== v) {
         records.push({ e: el, a: at, v: v });
         el.setAttribute(at, out);
+      }
+    }
+    if (el.tagName === 'INPUT' && el.hasAttribute('value') && el.type !== 'checkbox' && el.type !== 'radio' && el.type !== 'hidden') {
+      v = el.getAttribute('value');
+      if (v && HANGUL.test(v)) {
+        out = tr(v);
+        if (out !== v) {
+          records.push({ e: el, a: 'value', v: v });
+          el.setAttribute('value', out);
+          if (el.value === v) el.value = out;
+        }
       }
     }
     if (el.tagName === 'INPUT') {
