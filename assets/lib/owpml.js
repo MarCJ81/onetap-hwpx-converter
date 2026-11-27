@@ -404,7 +404,8 @@ function parsePageDef(secPr) {
       footer: numAttr(margin, 'footer', 4252),
       gutter: numAttr(margin, 'gutter', 0),
     },
-    defaultTabStop: numAttr(secPr, 'tabStopVal', 4000),
+    // HWPX는 기본 탭 간격을 tabStop(HWPUNIT)로 쓰고, tabStopVal은 옛 호환 값이다.
+    defaultTabStop: numAttr(secPr, 'tabStop', numAttr(secPr, 'tabStopVal', 8000)),
     lineGrid: numAttr(grid, 'lineGrid'),
     charGrid: numAttr(grid, 'charGrid'),
   };

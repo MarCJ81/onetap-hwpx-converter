@@ -15,8 +15,13 @@ import { writeCfb } from './cfb.js';
 import { buildDocInfo, normalizeResources } from './docinfo.js';
 import { buildSection } from './bodytext.js';
 
-/** HWP 5.1.0.0 — 최근 한글이 쓰는 버전. */
-const VERSION = 0x05010000;
+/**
+ * HWP 5.0.3.0 — 한글 2010까지도 경고 없이 여는 버전.
+ *
+ * 5.1.0.0으로 적으면 한글 2010/2014가 "상위 버전에서 작성한 문서입니다"
+ * 경고를 띄운다. 만드는 구조는 모두 HWP 5.0.3.0 규격이므로 버전도 그에 맞춘다.
+ */
+const VERSION = 0x05000300;
 const SIGNATURE = 'HWP Document File';
 
 function buildFileHeader(compressed) {
@@ -76,11 +81,14 @@ export async function writeHwp(doc) {
   const binDataStreams = [];
   for (const item of prepared.binData) {
     const raw = item.data;
+    // 문서가 압축 문서이면 BinData 스트림도 raw DEFLATE로 압축해 넣는다.
+    // (DocInfo의 BIN_DATA 레코드가 "기본" 압축 방식을 가리키므로 문서 압축
+    //  플래그를 그대로 따른다.)
     const deflated = canCompress ? await deflateRaw(raw) : null;
     binDataStreams.push({
       path: `BinData/${item.id}.${item.ext}`,
-      data: deflated && deflated.length < raw.length ? deflated : raw,
-      compressed: Boolean(deflated && deflated.length < raw.length),
+      data: deflated ?? raw,
+      compressed: Boolean(deflated),
     });
   }
   prepared.binData = prepared.binData.map((item, index) => ({

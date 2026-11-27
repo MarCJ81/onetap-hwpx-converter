@@ -162,15 +162,50 @@ function writeIdMappings(resources, binDataCount) {
 
 function writeBinData(item, index) {
   const writer = new ByteWriter();
-  // bit0-3: 종류(1=링크, 2=저장, 3=내장), bit4-5: 압축 여부(0=기본,1=압축,2=비압축)
-  writer.uint16(2 | ((item.compressed === false ? 2 : 0) << 4));
+  // bit0-3: 종류(0=링크, 1=내장, 2=저장), bit4-5: 압축 방식(0=기본,1=압축,2=비압축)
+  // 그림은 문서 안에 넣는 "내장"이고, 압축 방식은 문서 압축 플래그를 따른다.
+  writer.uint16(1 | ((item.compressed === false ? 2 : 0) << 4));
   writer.uint16(index + 1);
   writer.string(item.ext ?? 'bin');
   return writer;
 }
 
+/** 한글 기본 글꼴의 영문 이름 — 글꼴 레코드의 "기본 글꼴 이름"에 들어간다. */
+const LATIN_FONT_NAMES = {
+  함초롬돋움: 'HCR Dotum',
+  함초롬바탕: 'HCR Batang',
+  함초롬돋움체: 'HCR Dotum',
+  함초롬바탕체: 'HCR Batang',
+  HY견고딕: 'HYGothic-Medium',
+  휴먼명조: 'HmBatang',
+  굴림: 'Gulim',
+  굴림체: 'GulimChe',
+  돋움: 'Dotum',
+  돋움체: 'DotumChe',
+  바탕: 'Batang',
+  바탕체: 'BatangChe',
+  맑은고딕: 'Malgun Gothic',
+  새굴림: 'Saemul',
+  한양한강체: 'HYHanGang',
+};
+
+function latinFontName(name) {
+  const text = String(name ?? '');
+  if (LATIN_FONT_NAMES[text]) return LATIN_FONT_NAMES[text];
+  return /^[\x20-\x7e]*$/.test(text) ? text : '';
+}
+
+/** PANOSE-1 글꼴 유형 정보 — 한글이 쓰는 기본값. */
+const DEFAULT_PANOSE = [0x02, 0x03, 0x05, 0x04, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01];
+
 function writeFaceName(name) {
-  return new ByteWriter().uint8(0).string(name);
+  const writer = new ByteWriter();
+  // bit0-1: 글꼴 파일 형식(TTF=1), bit5: 기본 글꼴, bit6: 글꼴 유형 정보 있음
+  writer.uint8(0x61);
+  writer.string(name);
+  for (const value of DEFAULT_PANOSE) writer.uint8(value);
+  writer.string(latinFontName(name));
+  return writer;
 }
 
 function writeBorderFill(fill) {
@@ -303,19 +338,22 @@ function writeNumbering(numbering) {
     writeParagraphHead(writer, level);
   }
   writer.uint16(numbering.start ?? 1);
+  // 한글 5.0.3.0 이후가 남기는 예약 필드 7개.
+  for (let i = 0; i < 7; i++) writer.uint32(0);
   return writer;
 }
 
 function writeBullet(bullet) {
   const writer = new ByteWriter();
-  writeParagraphHead(writer, bullet.level ?? {});
+  let flags = 0;
+  flags = setBits(flags, 0, 1, bullet.align ?? 0);
+  flags = setBit(flags, 3, bullet.autoIndent);
+  writer.uint32(flags);
+  writer.hwpUnit16(bullet.width ?? 0);
+  writer.uint16(bullet.space ?? 0);
+  writer.int32(bullet.charShapeId ?? 0);
   const char = bullet.char && bullet.char.length ? bullet.char.charCodeAt(0) : 0x2022;
   writer.uint16(char);
-  writer.int32(bullet.useImage ? 1 : 0);
-  if (bullet.useImage) {
-    writer.uint8(0).uint8(0).uint8(0);
-    writer.uint16(bullet.binDataId ?? 1);
-  }
   return writer;
 }
 
@@ -363,23 +401,24 @@ function writeParaShape(shape) {
   properties3 = setBits(properties3, 0, 4, shape.lineSpacing?.kind ?? 0);
   writer.uint32(properties3);
   writer.uint32(shape.lineSpacing?.value ?? 160);
-  // 한글이 덧붙이는 꼬리 필드.
-  writer.uint32(0);
   return writer;
 }
 
-function writeStyle(style) {
+function writeStyle(style, paraShapeCount, charShapeCount) {
   const writer = new ByteWriter();
+  const paraShapeId = Math.max(0, Math.min(style.paraShapeId ?? 0, Math.max(0, paraShapeCount - 1)));
+  const charShapeId = Math.max(0, Math.min(style.charShapeId ?? 0, Math.max(0, charShapeCount - 1)));
+  const nextStyleId = Math.max(0, Math.min(style.nextStyleId ?? 0, 255));
   writer.string(style.name ?? '');
   writer.string(style.englishName ?? '');
   let properties = 0;
   properties = setBits(properties, 0, 2, style.kind === 1 ? 1 : 0);
   properties = setBit(properties, 3, style.lockForm);
   writer.uint8(properties);
-  writer.uint8(style.nextStyleId ?? 0);
+  writer.uint8(nextStyleId);
   writer.int16(style.langId ?? 1042);
-  writer.uint16(style.paraShapeId ?? 0);
-  writer.uint16(style.charShapeId ?? 0);
+  writer.uint16(paraShapeId);
+  writer.uint16(charShapeId);
   writer.uint16(0);
   return writer;
 }
@@ -403,7 +442,9 @@ export function buildDocInfo(doc) {
   for (const numbering of resources.numberings) writer.write(DocInfoTag.Numbering, writeNumbering(numbering));
   for (const bullet of resources.bullets) writer.write(DocInfoTag.Bullet, writeBullet(bullet));
   for (const shape of resources.paraShapes) writer.write(DocInfoTag.ParaShape, writeParaShape(shape));
-  for (const style of resources.styles) writer.write(DocInfoTag.Style, writeStyle(style));
+  for (const style of resources.styles) {
+    writer.write(DocInfoTag.Style, writeStyle(style, resources.paraShapes.length, resources.charShapes.length));
+  }
 
   return writer.finish();
 }

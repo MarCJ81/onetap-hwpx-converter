@@ -113,8 +113,13 @@ function encodeParagraph(paragraph, options = {}) {
   const state = newParagraphState();
 
   if (options.section) {
-    pushExtended(state, CHAR_SECTION);
+    // 구역 정의(secd)와 단 정의(cold)는 본문 첫 문단의 글자 흐름 안에
+    // 8글자 제어 문자로 자리를 잡고, 예약 6글자에 컨트롤 id를 담는다.
+    // id가 비어 있으면 한글이 알 수 없는 컨트롤로 보고 "파일이 손상되었습니다"를 띄운다.
+    pushExtended(state, CHAR_SECTION, ctrlIdCodes(CTRL.SectionDefinition));
     state.controls.push({ type: 'section', section: options.section });
+    pushExtended(state, CHAR_SECTION, ctrlIdCodes(CTRL.ColumnDefinition));
+    state.controls.push({ type: 'columns', section: options.section });
   }
 
   let lastShape = -1;
@@ -183,9 +188,25 @@ function encodeParagraph(paragraph, options = {}) {
   }
 
   state.codes.push(CHAR_PARA_BREAK);
+  // 컨트롤이 하나라도 있으면 문단 제어 마스크의 "컨트롤 포함" 비트(11)를 켜다.
+  // 한글은 이 비트가 없으면 뒤따르는 CTRL_HEADER를 읽지 않는다.
+  if (state.controls.length > 0) state.mask |= 1 << 11;
   if (state.charShapes.length === 0) {
     state.charShapes.push({ position: 0, charShapeId: paragraph.runs[0]?.charShapeId ?? 0 });
+  } else if (state.charShapes[0].position > 0) {
+    // 한글은 문단 첫 글자 모양 항목을 항상 위치 0에 둔다. 문단 앞쪽 제어 문자도
+    // 그 글자 모양을 쓴다.
+    state.charShapes.unshift({ position: 0, charShapeId: state.charShapes[0].charShapeId });
   }
+  // 같은 자리·같은 모양 항목이 겹치면 한글이 어느 것을 쓸지 모호해진다.
+  const merged = [];
+  for (const entry of state.charShapes) {
+    const last = merged[merged.length - 1];
+    if (last && last.position === entry.position) last.charShapeId = entry.charShapeId;
+    else if (last && last.charShapeId === entry.charShapeId) continue;
+    else merged.push({ ...entry });
+  }
+  state.charShapes = merged;
   return state;
 }
 
@@ -205,15 +226,18 @@ function writeParagraph(writer, doc, paragraph, options = {}) {
   split = setBit(split, 3, paragraph.columnBreak);
   header.uint8(split);
   header.uint16(state.charShapes.length);
-  header.uint16(0);
-  header.uint16(0);
-  header.uint32(0);
+  header.uint16(0); // 범위 태그 수
+  header.uint16(options.lineHeight ? 1 : 0); // 줄 배치 레코드 수
+  header.uint32(0); // 개체 id
   header.uint16(0);
 
   writer.nested(SectionTag.ParaHeader, header, () => {
-    const text = new ByteWriter();
-    for (const code of state.codes) text.uint16(code);
-    writer.write(SectionTag.ParaText, text);
+    // 빈 문단(문단 끝 한 글자뿐)은 한글도 PARA_TEXT를 쓰지 않는다.
+    if (state.codes.length > 1 || state.controls.length > 0) {
+      const text = new ByteWriter();
+      for (const code of state.codes) text.uint16(code);
+      writer.write(SectionTag.ParaText, text);
+    }
 
     const shapes = new ByteWriter();
     for (const entry of state.charShapes) {
@@ -275,6 +299,9 @@ function writeControl(writer, doc, control) {
     case 'section':
       writeSectionDefinition(writer, control.section);
       return;
+    case 'columns':
+      writeColumnsDefinition(writer);
+      return;
     case 'table':
       writeTable(writer, doc, control);
       return;
@@ -304,12 +331,13 @@ function writeControl(writer, doc, control) {
     case 'footnote':
     case 'endnote': {
       const header = new ByteWriter();
-      header.uint32(ctrlId(control.type === 'footnote' ? CTRL.Footnote : CTRL.Endnote));
+      const footnote = control.type === 'footnote';
+      header.uint32(ctrlId(footnote ? CTRL.Footnote : CTRL.Endnote));
       header.uint32(1); // 번호
-      header.uint16(0);
-      header.uint16(0x29); // 접미 기호 ')'
-      header.uint32(0);
-      header.uint32(0);
+      header.uint16(footnote ? 0x003c : 0); // 사용자 기호
+      header.uint16(footnote ? 0x003e : 0x0029); // 접미 기호
+      header.uint32(footnote ? 2 : 0); // 속성
+      header.uint32(0); // 개체 id
       writer.nested(SectionTag.CtrlHeader, header, () => {
         writeParagraphList(writer, doc, control.paragraphs, (count) => {
           const listHeader = new ByteWriter();
@@ -325,10 +353,10 @@ function writeControl(writer, doc, control) {
     case 'autoNumber': {
       const header = new ByteWriter();
       header.uint32(ctrlId(CTRL.AutoNumber));
-      header.uint32(1); // 플래그
+      header.uint32(0x21); // 속성
       header.uint32(control.number ?? 1);
-      header.uint16(0); // 접두 기호
-      header.uint16(control.suffix ?? 0x29); // 접미 기호
+      header.uint16(0x003c); // 구분 문자 '<'
+      header.uint16(0x003e); // 구분 문자 '>'
       writer.write(SectionTag.CtrlHeader, header);
       return;
     }
@@ -342,19 +370,19 @@ function writeSectionDefinition(writer, section) {
   const header = new ByteWriter();
   header.uint32(ctrlId(CTRL.SectionDefinition));
   let flags = 0;
-  header.uint32(flags);
-  header.hwpUnit16(pageDef.columnSpacing ?? 1134);
-  header.hwpUnit16(pageDef.lineGrid ?? 0);
-  header.hwpUnit16(pageDef.charGrid ?? 0);
-  header.hwpUnit(pageDef.defaultTabStop ?? 4000);
-  header.uint16(0);
-  header.uint16(0);
-  header.uint16(0);
-  header.uint16(0);
-  header.uint16(0);
-  header.uint32(0);
-  header.uint32(0);
-  void flags;
+  header.uint32(flags); // 구역 표시/숨김 속성
+  header.hwpUnit16(pageDef.columnSpacing ?? 1134); // 단 간격
+  header.hwpUnit16(pageDef.lineGrid ?? 0); // 줄 격자
+  header.hwpUnit16(pageDef.charGrid ?? 0); // 문자 격자
+  header.hwpUnit(pageDef.defaultTabStop ?? 8000); // 기본 탭 간격
+  header.uint16(1); // 문단 번호 모양 id
+  header.uint16(pageDef.startingPageNumber ?? 0); // 시작 쪽 번호
+  header.uint16(0); // 시작 그림 번호
+  header.uint16(0); // 시작 표 번호
+  header.uint16(0); // 시작 수식 번호
+  header.uint32(0); // 예약
+  header.uint32(0); // 예약
+  header.uint16(0); // 꼬리 예약
 
   writer.nested(SectionTag.CtrlHeader, header, () => {
     const page = new ByteWriter();
@@ -373,26 +401,57 @@ function writeSectionDefinition(writer, section) {
     page.uint32(properties);
     writer.write(SectionTag.PageDef, page);
 
-    // 한글이 파일을 열려면 각주/미주 모양 레코드가 있어야 한다.
-    writer.write(SectionTag.FootnoteShape, noteShape(283, -1, 567));
-    writer.write(SectionTag.FootnoteShape, noteShape(0, 12280, 567));
+    // 각주 모양 → 미주 모양 → 쪽 테두리/배경 3개(첫 쪽·홀수 쪽·짝수 쪽) 순서가
+    // 한글의 구역 정의 고정 순서다. 하나라도 빠지면 구역 정의가 손상된 것으로 읽힌다.
+    writer.write(SectionTag.FootnoteShape, noteShape({ spacing: 283, splitterLength: -1, splitterUnknown: -1, marginTop: 850, marginBottom: 567 }));
+    writer.write(SectionTag.FootnoteShape, noteShape({ spacing: 0, splitterLength: 12280, splitterUnknown: 224, marginTop: 850, marginBottom: 567 }));
+    for (let index = 0; index < 3; index++) {
+      writer.write(SectionTag.PageBorderFill, pageBorderFill());
+    }
   });
 }
 
-function noteShape(spacing, splitterLength, marginBottom) {
+/** 구역 정의 아래의 단 정의(CTRL_HEADER `cold`) — 보통 한 단. */
+function writeColumnsDefinition(writer) {
+  const header = new ByteWriter();
+  header.uint32(ctrlId(CTRL.ColumnDefinition));
+  let flags = 0;
+  flags = setBits(flags, 0, 1, 0); // 단 종류: 보통
+  flags = setBits(flags, 2, 9, 1); // 단 개수
+  flags = setBits(flags, 10, 11, 0); // 단 방향: 왼쪽→오른쪽
+  flags = setBit(flags, 12, true); // 같은 폭
+  header.uint16(flags);
+  header.hwpUnit16(0); // 단 간격
+  header.uint16(0); // 예약
+  header.uint8(0); // 단 구분선 종류: 없음
+  header.uint8(0); // 굵기
+  header.color(0); // 색
+  writer.write(SectionTag.CtrlHeader, header);
+}
+
+/** 쪽 테두리/배경 — 테두리 없음(용지 기준). */
+function pageBorderFill() {
+  const writer = new ByteWriter();
+  writer.uint32(1); // 용지 기준
+  writer.hwpUnit16(1417).hwpUnit16(1417).hwpUnit16(1417).hwpUnit16(1417);
+  writer.uint16(1); // 테두리/배경 id (DocInfo 첫 항목)
+  return writer;
+}
+
+function noteShape({ spacing, splitterLength, splitterUnknown = -1, marginTop, marginBottom }) {
   const writer = new ByteWriter();
   writer.uint32(0); // flags
-  writer.uint16(0x0029); // 사용자 기호 ')'
-  writer.uint16(0x0029); // 접두
-  writer.uint16(0); // 접미
+  writer.uint16(0); // 사용자 기호
+  writer.uint16(0); // 접두 기호
+  writer.uint16(0x0029); // 접미 기호 ')'
   writer.uint16(1); // 시작 번호
-  writer.hwpUnit16(splitterLength);
-  writer.hwpUnit16(850);
-  writer.hwpUnit16(0);
-  writer.hwpUnit16(marginBottom);
-  writer.hwpUnit16(spacing);
+  writer.hwpUnit16(splitterLength); // 구분선 길이
+  writer.hwpUnit16(splitterUnknown); // 예약
+  writer.hwpUnit16(marginTop); // 구분선 위 여백
+  writer.hwpUnit16(marginBottom); // 구분선 아래 여백
+  writer.hwpUnit16(spacing); // 각주 사이 간격
   writer.uint8(1); // 구분선 종류: 실선
-  writer.uint8(0); // 굵기 0.1mm
+  writer.uint8(1); // 굵기 0.12mm
   writer.color(0);
   return writer;
 }
@@ -506,9 +565,8 @@ function writePlacement(writer, placement) {
   writer.int16(placement.marginRight ?? 0);
   writer.uint32(0); // instance id
   // 개체 공통 속성의 꼬리: 예약 필드와 빈 설명 문자열.
-  writer.uint16(0);
+  writer.int16(0);
   writer.string('');
-  writer.uint16(0);
 }
 
 /** 2D 변환 행렬 (a c e / b d f / 0 0 1). */
