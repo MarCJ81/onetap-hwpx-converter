@@ -105,7 +105,9 @@ export async function writeHwp(doc) {
   const pack = async (bytes) => {
     if (!canCompress) return bytes;
     const deflated = await deflateRaw(bytes);
-    return deflated ?? bytes;
+    // 압축 플래그를 켜 놓고 원본을 넣으면 한글이 스트림을 풀지 못해 파일이 깨진다.
+    if (!deflated) throw new Error('스트림 압축에 실패했습니다. 잠시 후 다시 시도해 주세요.');
+    return deflated;
   };
 
   streams.DocInfo = await pack(docInfoRaw);
